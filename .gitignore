@@ -1,0 +1,9 @@
+# Per-incident documentation with client data: kept local, never published
+audits/
+consulsped/
+# Tooling state
+.serena/
+.conductor/
+.claude/settings.local.json
+# Secrets
+*.token

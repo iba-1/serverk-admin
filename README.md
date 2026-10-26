@@ -1,11 +1,13 @@
 <p align="center">
-  <h1 align="center">cPanel Forensics Toolkit</h1>
+  <h1 align="center">serverk-admin</h1>
   <p align="center">
-    Toolkit Bash per incident response, ripristino e audit su server cPanel/WHM/CloudLinux.
+    Script Bash per amministrare un server cPanel/WHM su CloudLinux 8:
     <br />
-    Sviluppato durante un caso reale di ransomware (SorryGo, 2026) su un VPS con ~30 account cPanel
+    incident response e ripristino (nato dal caso ransomware SorryGo, 2026), hardening,
     <br />
-    che ospitavano siti Symfony 1.x e 2.x.
+    e risposta alle vulnerabilità PHP (php2shell, ottobre 2026).
+    <br />
+    Il server ospita ~30 account con siti Symfony 1.x e 2.x su PHP legacy (HardenedPHP).
   </p>
 </p>
 
@@ -13,7 +15,10 @@
 
 ## Indice
 
-- [Panoramica](#panoramica)
+- [Struttura del repo](#struttura-del-repo)
+- [Hardening](#hardening)
+- [php2shell (CVE-2026-109618 / 109619)](#php2shell-cve-2026-109618--109619)
+- [Panoramica forensics](#panoramica)
 - [Prerequisiti](#prerequisiti)
 - [Installazione](#installazione)
 - [Script](#script)
@@ -32,9 +37,41 @@
 
 ---
 
+## Struttura del repo
+
+```
+*.sh                 toolkit forensics / ripristino (vedi sotto)
+harden-0N-*.sh       hardening incrementale (CSF, MariaDB bind, ModSecurity, SSH)
+php2shell/           mitigazione + patch per CVE-2026-109618 / CVE-2026-109619
+audits/              documentazione per-incidente con dati cliente: NON versionata (.gitignore)
+```
+
+Il repo è pubblico: nessun hostname di cliente, username cPanel o token deve finire nei file tracciati.
+I report con dati reali vivono in `audits/` in locale.
+
+## Hardening
+
+Quattro script indipendenti, ciascuno con dry-run, backup e rollback:
+
+| Script | Area |
+|---|---|
+| `harden-01-csf-firewall.sh` | CSF/LFD: porte, rate-limit, alert |
+| `harden-02-mariadb-bind.sh` | MariaDB solo su localhost, utenti remoti |
+| `harden-03-modsecurity.sh` | mod_security2 + OWASP CRS con esclusioni per Symfony |
+| `harden-05-ssh-keys.sh` | SSH solo a chiave, utenti ammessi |
+
+## php2shell (CVE-2026-109618 / 109619)
+
+Due RCE non autenticate in PHP core (CVSS v4 9.2), fix upstream solo per 8.2+.
+`php2shell/` contiene mitigazione immediata senza impatto applicativo (regole mod_security mirate,
+`LimitRequestBody`, `session.upload_progress` off), patch automatica quando EA4 pubblica i pacchetti,
+rollback e verifica. Dettagli in [`php2shell/README.md`](php2shell/README.md).
+
+---
+
 ## Panoramica
 
-Il toolkit copre l'intero ciclo di risposta a un incidente su server cPanel:
+Il toolkit forensics copre l'intero ciclo di risposta a un incidente su server cPanel:
 
 ```
 Raccolta forense ──> Rilevamento ransomware ──> Ripristino siti ──> Audit post-ripristino
@@ -57,10 +94,10 @@ Ogni script e pensato per essere eseguito come `root` su un server CentOS/CloudL
 
 ```bash
 # Clonare il repo
-git clone https://github.com/iba-1/cpanel-forensics.git
+git clone https://github.com/iba-1/serverk-admin.git
 
 # Caricare gli script sul server
-scp cpanel-forensics/*.sh root@server:/root/
+scp serverk-admin/*.sh root@server:/root/
 
 # Renderli eseguibili
 ssh root@server 'chmod +x /root/*.sh'

@@ -1,0 +1,663 @@
+#!/usr/bin/perl
+# server-digest — server health report
+# Daily: full logwatch to TECH_TO
+# Weekly (--weekly): HTML summary to SUMMARY_TO + Cc TECH_TO
+# --dry-run: print the HTML to stdout, send nothing
+#
+# Sections: Risorse (disk/mem/load), Sicurezza (CSF, auditd, rkhunter),
+# Backup (local set, remote copies, space for the next run), Servizi.
+# Versioned copy: serverk-admin repo, digest/server-digest. Installed at /usr/local/bin/server-digest.
+use strict;
+use warnings;
+use POSIX qw(strftime);
+use Getopt::Long;
+use Time::Local qw(timelocal);
+
+my $send_summary = 0;
+my $dry_run      = 0;   # --dry-run: print the HTML to stdout instead of mailing it
+my $show_config  = 0;   # --show-config: print resolved recipients and exit
+GetOptions('weekly' => \$send_summary, 'dry-run' => \$dry_run, 'show-config' => \$show_config);
+
+# --- Config ---
+# Site-specific values live in /etc/server-digest.conf (KEY=value, root:600), e.g.
+#   TECH_TO=admin@example.com
+#   SUMMARY_TO=owner@example.com
+#   FROM=server@example.com
+#   HOSTNAME=server.example.com
+my $CONF_FILE = '/etc/server-digest.conf';
+my %conf = (
+    TECH_TO    => 'root@localhost',
+    SUMMARY_TO => 'root@localhost',
+    FROM       => 'root@localhost',
+    HOSTNAME   => do { my $h = `hostname -f 2>/dev/null`; chomp $h; $h || 'localhost' },
+);
+if (open my $cf, '<', $CONF_FILE) {
+    while (my $l = <$cf>) {
+        next if $l =~ /^\s*(#|$)/;
+        $conf{$1} = $2 if $l =~ /^\s*([A-Z_]+)\s*=\s*"?([^"\s]+)"?\s*$/;
+    }
+    close $cf;
+}
+my $TECH_TO    = $conf{TECH_TO};
+my $SUMMARY_TO = $conf{SUMMARY_TO};
+my $FROM       = $conf{FROM};
+my $HOSTNAME   = $conf{HOSTNAME};
+my $SENDMAIL   = "/usr/sbin/sendmail -t -f $FROM";
+my $SHORTNAME  = (split /\./, $HOSTNAME)[0];
+
+if ($show_config) {
+    print "$_=$conf{$_}\n" for sort keys %conf;
+    print "config file: ", (-r $CONF_FILE ? $CONF_FILE : "(none, using defaults)"), "\n";
+    exit 0;
+}
+
+my $date_str;
+my $logwatch_range;
+if ($send_summary) {
+    my $from = strftime("%m/%d/%Y", localtime(time - 7*86400));
+    my $to   = strftime("%m/%d/%Y", localtime(time - 86400));
+    $logwatch_range = "--range \"between $from and $to\"";
+    my $from_pretty = strftime("%d %b", localtime(time - 7*86400));
+    my $to_pretty   = strftime("%d %b %Y", localtime(time - 86400));
+    $date_str = "$from_pretty — $to_pretty";
+} else {
+    $logwatch_range = "--range yesterday";
+    $date_str = strftime("%a %d %b %Y", localtime(time - 86400));
+}
+
+# --- Collect data ---
+
+# Logwatch
+my $logwatch = `/usr/sbin/logwatch $logwatch_range --output stdout --detail Med 2>&1`;
+
+# HTML-escape logwatch for embedding in <pre>
+(my $logwatch_escaped = $logwatch) =~ s/&/&amp;/g;
+$logwatch_escaped =~ s/</&lt;/g;
+$logwatch_escaped =~ s/>/&gt;/g;
+
+# Disk usage
+my @disk_entries;
+my $disk_raw = `df -h / /tmp /home 2>/dev/null`;
+my %disk_seen;
+for my $line (split /\n/, $disk_raw) {
+    if ($line =~ m{(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)%\s+(/\S*)}) {
+        my ($dev, $size, $used, $avail, $pct, $mount) = ($1, $2, $3, $4, $5, $6);
+        next if $disk_seen{$mount}++;
+        push @disk_entries, { mount => $mount, size => $size, used => $used, avail => $avail, pct => $pct };
+    }
+}
+
+# Uptime + load
+my $uptime_raw = `ssh localhost uptime 2>/dev/null || uptime`;
+chomp $uptime_raw;
+my ($uptime_str) = $uptime_raw =~ /up\s+(.+?),\s+\d+ user/;
+$uptime_str //= "N/D";
+my ($load1, $load5, $load15) = $uptime_raw =~ /load average:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)/;
+$load1  //= "?";
+$load5  //= "?";
+$load15 //= "?";
+
+# Memory
+my $mem_raw = `free -m 2>/dev/null`;
+my ($mem_total, $mem_used, $mem_avail) = (0, 0, 0);
+if ($mem_raw =~ /Mem:\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+\d+\s+(\d+)/) {
+    ($mem_total, $mem_used, $mem_avail) = ($1, $2, $3);
+}
+my $mem_pct = $mem_total > 0 ? int(($mem_total - $mem_avail) / $mem_total * 100) : 0;
+my $swap_raw = `free -m 2>/dev/null | grep Swap`;
+my ($swap_total, $swap_used) = (0, 0);
+if ($swap_raw =~ /Swap:\s+(\d+)\s+(\d+)/) {
+    ($swap_total, $swap_used) = ($1, $2);
+}
+
+# CPU count
+my $cpu_count = `nproc 2>/dev/null`;
+chomp $cpu_count;
+$cpu_count ||= 1;
+
+# --- Backups ---
+# Sources (all read-only):
+#   /var/cpanel/backups/config                      backup settings (dir, retention, free-space floor)
+#   /var/cpanel/backups/*.backup_destination        remote destinations (S3 etc.)
+#   <BACKUPDIR>/YYYY-MM-DD, weekly/, monthly/       local sets
+#   /usr/local/cpanel/logs/cpbackup/<epoch>.log     one log per run
+#   /usr/local/cpanel/logs/cpbackup_transporter.log remote transfer log
+#   whmapi1 listaccts                               accounts that should be in each set
+
+sub read_flat_yaml {
+    my ($path) = @_;
+    my %h;
+    open my $fh, '<', $path or return \%h;
+    while (my $l = <$fh>) {
+        next unless $l =~ /^([A-Za-z_][\w]*):\s*'?([^']*?)'?\s*$/;
+        $h{$1} = $2;
+    }
+    close $fh;
+    return \%h;
+}
+
+sub human_bytes {
+    my ($b) = @_;
+    return "0" unless $b;
+    my @u = ('B', 'K', 'M', 'G', 'T');
+    my $i = 0;
+    while ($b >= 1024 && $i < $#u) { $b /= 1024; $i++; }
+    return $i >= 3 ? sprintf("%.1f%s", $b, $u[$i]) : sprintf("%d%s", $b, $u[$i]);
+}
+
+sub days_ago {
+    my ($ymd) = @_;
+    return undef unless $ymd =~ /^(\d{4})-(\d{2})-(\d{2})$/;
+    my $t = eval { timelocal(0, 0, 12, $3, $2 - 1, $1) };
+    return undef unless $t;
+    my $today = timelocal(0, 0, 12, (localtime)[3, 4, 5]);
+    return int(($today - $t) / 86400 + 0.5);
+}
+
+my $bconf          = read_flat_yaml('/var/cpanel/backups/config');
+my $backup_enabled = ($bconf->{BACKUPENABLE} // 'no') eq 'yes';
+my $backup_dir     = $bconf->{BACKUPDIR} // '/backup';
+my $keep_local     = $bconf->{KEEPLOCAL} // 1;
+my $ret_daily      = $bconf->{BACKUP_DAILY_RETENTION}   // 0;
+my $ret_weekly     = $bconf->{BACKUP_WEEKLY_RETENTION}  // 0;
+my $ret_monthly    = $bconf->{BACKUP_MONTHLY_RETENTION} // 0;
+my $min_free       = ($bconf->{CHECK_MIN_FREE_SPACE} // 0) ? ($bconf->{MIN_FREE_SPACE} // 0) : 0;
+my $min_free_unit  = $bconf->{MIN_FREE_SPACE_UNIT} // 'percent';
+
+# Accounts that cPanel is expected to back up (backup flag on, not suspended)
+my @expected_accts;
+my $acct_disk_bytes = 0;
+my $accts_json = `whmapi1 listaccts --output=json 2>/dev/null`;
+if ($accts_json && eval { require JSON::PP; 1 }) {
+    my $d = eval { JSON::PP::decode_json($accts_json) };
+    if ($d && ref $d->{data}{acct} eq 'ARRAY') {
+        for my $a (@{ $d->{data}{acct} }) {
+            $acct_disk_bytes += ($a->{diskused} // '0') =~ /^([\d.]+)M/ ? $1 * 1024 * 1024 : 0;
+            next if $a->{suspended};
+            next unless $a->{backup};
+            push @expected_accts, $a->{user};
+        }
+    }
+}
+my $expected_count = scalar @expected_accts;
+
+# Local sets: daily (BACKUPDIR/YYYY-MM-DD), weekly/, monthly/
+sub list_sets {
+    my ($dir) = @_;
+    opendir my $dh, $dir or return ();
+    my @s = sort grep { /^\d{4}-\d{2}-\d{2}$/ && -d "$dir/$_" } readdir $dh;
+    closedir $dh;
+    return @s;
+}
+sub set_info {
+    my ($dir) = @_;
+    my %info = (count => 0, bytes => 0, users => {});
+    if (opendir my $dh, "$dir/accounts") {
+        for my $f (readdir $dh) {
+            next unless $f =~ /^(.+)\.tar(?:\.gz)?$/;
+            $info{users}{$1} = 1;
+            $info{count}++;
+            $info{bytes} += (stat("$dir/accounts/$f"))[7] // 0;
+        }
+        closedir $dh;
+    }
+    return \%info;
+}
+
+my @daily_sets   = list_sets($backup_dir);
+my @weekly_sets  = list_sets("$backup_dir/weekly");
+my @monthly_sets = list_sets("$backup_dir/monthly");
+my $local_bytes  = 0;
+my %daily_info;
+for my $s (@daily_sets)   { $daily_info{$s} = set_info("$backup_dir/$s"); $local_bytes += $daily_info{$s}{bytes}; }
+for my $s (@weekly_sets)  { $local_bytes += set_info("$backup_dir/weekly/$s")->{bytes}; }
+for my $s (@monthly_sets) { $local_bytes += set_info("$backup_dir/monthly/$s")->{bytes}; }
+
+# Run logs: map each run to its backup date and final state
+my %runs;   # date => { state, start, end, ok, failed, log }
+for my $log (glob("/usr/local/cpanel/logs/cpbackup/*.log")) {
+    open my $fh, '<', $log or next;
+    my ($date, $start, $end, $state, $ok, $failed) = (undef, undef, undef, undef, 0, 0);
+    while (my $l = <$fh>) {
+        $start //= $1 if $l =~ /^\[(\d{4}-\d\d-\d\d \d\d:\d\d)/;
+        $date  //= $1 if $l =~ m{backup at \Q$backup_dir\E/(\d{4}-\d\d-\d\d)};
+        $ok++      if $l =~ /Successfully backed up account/;
+        $failed++  if $l =~ /Failed to back\s?up|Unable to back\s?up account/i;
+        $end   = $1 if $l =~ /^\[(\d{4}-\d\d-\d\d \d\d:\d\d)[^\]]*\].*Final state is Backup::(\w+)/ && ($state = $2);
+    }
+    close $fh;
+    next unless $date;
+    my $mtime = (stat($log))[9];
+    $state //= (time - $mtime < 6 * 3600) ? 'Running' : 'Incomplete';
+    next if $runs{$date} && $runs{$date}{mtime} > $mtime;   # keep newest run per date
+    $runs{$date} = { state => $state, start => $start, end => $end, ok => $ok, failed => $failed, mtime => $mtime };
+}
+
+# Reference set = newest daily set whose run is not still in progress
+my $running_date;
+my $ref_date;
+for my $s (reverse @daily_sets) {
+    if ($runs{$s} && $runs{$s}{state} eq 'Running') { $running_date = $s; next; }
+    $ref_date = $s;
+    last;
+}
+my $ref_info  = $ref_date ? $daily_info{$ref_date} : { count => 0, bytes => 0, users => {} };
+my $ref_run   = $ref_date ? $runs{$ref_date} : undef;
+my $ref_age   = $ref_date ? days_ago($ref_date) : undef;
+my @local_missing = $ref_date ? grep { !$ref_info->{users}{$_} } @expected_accts : ();
+
+# Remote destinations
+my @destinations;
+for my $f (glob("/var/cpanel/backups/*.backup_destination")) {
+    my $d = read_flat_yaml($f);
+    push @destinations, {
+        name      => $d->{name} // 'remote',
+        type      => $d->{type} // '?',
+        disabled  => $d->{disabled} // 0,
+        logs_only => $d->{only_used_for_logs} // 0,
+        bucket    => $d->{bucket} // $d->{host} // '',
+        folder    => $d->{folder} // $d->{path} // '',
+    };
+}
+my @active_dest = grep { !$_->{disabled} && !$_->{logs_only} } @destinations;
+
+# Transporter log: what actually reached the remote for the reference set
+my %remote;   # dest name => { users => {}, failed => n, last_ok => ts }
+my $transporter_last_ok;
+if ($ref_date && open my $fh, '<', '/usr/local/cpanel/logs/cpbackup_transporter.log') {
+    while (my $l = <$fh>) {
+        next unless $l =~ /^\[(\d{4}-\d\d-\d\d \d\d:\d\d)[^\]]*\]/;
+        my $ts = $1;
+        if ($l =~ /Successful transfer of (\S+) to \S+ for destination (.+?)\s*$/) {
+            my ($src, $dest) = ($1, $2);
+            $transporter_last_ok = $ts;
+            next unless $src =~ m{\Q$backup_dir\E/\Q$ref_date\E/accounts/(.+?)\.tar(?:\.gz)?$};
+            $remote{$dest}{users}{$1} = 1;
+            $remote{$dest}{last_ok} = $ts;
+        }
+        elsif ($l =~ m{\Q$backup_dir\E/\Q$ref_date\E/} && $l =~ /\b(fail|unable|error)/i) {
+            my ($dest) = $l =~ /for destination (.+?)\s*$/;
+            $remote{$dest // 'remote'}{failed}++;
+        }
+    }
+    close $fh;
+}
+
+# Free space on the backup volume vs cPanel's floor
+my $backup_fs = `df -P $backup_dir 2>/dev/null | tail -1`;
+my ($bfs_size, $bfs_avail, $bfs_pct) = $backup_fs =~ /\s(\d+)\s+\d+\s+(\d+)\s+(\d+)%/ ? ($1, $2, $3) : (0, 0, 0);
+my $bfs_free_pct = $bfs_size ? int($bfs_avail / $bfs_size * 100) : 0;
+my $floor_pct = $min_free_unit eq 'percent' ? $min_free : ($bfs_size ? int($min_free * 1024 * 1024 / $bfs_size * 100) : 0);
+my $floor_label = $min_free_unit eq 'percent' ? "${min_free}%" : "${min_free} MB";
+my $next_blocked = $min_free && $bfs_free_pct <= $floor_pct;
+
+# Status for the legacy "Backup" line (last run outcome)
+my $backup_status = "sconosciuto";
+if ($ref_run) {
+    $backup_status = $ref_run->{state} eq 'Success' ? "OK"
+                   : $ref_run->{state} eq 'Running' ? "in corso"
+                   : $ref_run->{state} eq 'Incomplete' ? "incompleto"
+                   : "FALLITO ($ref_run->{state})";
+}
+
+# Mail queue
+my $mail_queue = `exim -bpc 2>/dev/null`;
+chomp $mail_queue;
+$mail_queue //= "?";
+
+# Apache connections
+my $apache_conns = `ss -tnp 2>/dev/null | grep -c ':80\\|:443' || echo 0`;
+chomp $apache_conns;
+
+# MySQL status
+my $mysql_uptime = `mysqladmin status 2>/dev/null | grep -oP 'Uptime: \\K\\d+'`;
+chomp $mysql_uptime;
+my $mysql_up_days = $mysql_uptime ? int($mysql_uptime / 86400) : "?";
+my $mysql_threads = `mysqladmin status 2>/dev/null | grep -oP 'Threads: \\K\\d+'`;
+chomp $mysql_threads;
+$mysql_threads ||= "?";
+
+# --- Parse logwatch ---
+
+my ($ssh_blocked, $cpanel_blocked, $smtp_blocked, $other_blocked) = (0, 0, 0, 0);
+my $integrity_count = 0;
+my @proc_users;
+my $load_alerts = 0;
+my $clamav_outdated = 0;
+
+if ($logwatch =~ /CSF\/LFD Firewall Begin(.+?)CSF\/LFD Firewall End/s) {
+    my $csf = $1;
+    while ($csf =~ /^\s+(LF_\S+).*?:\s*(\d+)\s+blocks/mg) {
+        my ($rule, $count) = ($1, $2);
+        if    ($rule =~ /SSHD/)          { $ssh_blocked    += $count; }
+        elsif ($rule =~ /CPANEL/)        { $cpanel_blocked += $count; }
+        elsif ($rule =~ /SMTP|EXIM/)     { $smtp_blocked   += $count; }
+        else                             { $other_blocked  += $count; }
+    }
+    while ($csf =~ /^\s+(\S+): peak (\d+) processes/mg) {
+        push @proc_users, { user => $1, peak => $2 };
+    }
+    if ($csf =~ /integrity check triggered:\s*(\d+)/i) { $integrity_count = $1; }
+    if ($csf =~ /High load alerts?:\s*(\d+)/i) { $load_alerts = $1; }
+}
+
+my $total_blocked = $ssh_blocked + $cpanel_blocked + $smtp_blocked + $other_blocked;
+
+if ($logwatch =~ /OUTDATED/i) { $clamav_outdated = 1; }
+
+# Exim auth failures
+my $exim_auth_fail = 0;
+my @auth_lines = ($logwatch =~ /authenticator failed/gi);
+$exim_auth_fail = scalar @auth_lines;
+
+# --- Parse auditd file integrity section ---
+my @audit_alerts;     # anomalous events
+my $audit_total = 0;
+my $audit_normal = 0;
+
+if ($logwatch =~ /File Integrity Monitoring \(auditd\) Begin(.+?)File Integrity Monitoring \(auditd\) End/s) {
+    my $audit_section = $1;
+
+    if ($audit_section =~ /(\d+) file modification event/) {
+        $audit_total = $1;
+    }
+
+    # Parse each event line:  /path/to/file   N time(s)  /usr/bin/cmd (user: root)
+    while ($audit_section =~ /^\s+(\S+)\s+(\d+)\s+time\(s\)\s+(.+)$/mg) {
+        my ($file, $count, $actor) = ($1, $2, $3);
+
+        my $normal = 0;
+
+        # cPanel maintenance on its own account files
+        if ($actor =~ m{/usr/local/cpanel/} && $file =~ m{^/var/cpanel/users}) {
+            $normal = 1;
+        }
+        # cPanel cron SSL renewal
+        if ($actor =~ m{/usr/local/cpanel/} && $file =~ m{^/etc/cron\.d/.*cpanel}) {
+            $normal = 1;
+        }
+        # cPanel PAM config updates
+        if ($actor =~ m{/usr/local/cpanel/} && $file =~ m{^/etc/pam\.d/}) {
+            $normal = 1;
+        }
+        # LFD updating csf.deny
+        if ($actor =~ m{/usr/local/cpanel/} && $file =~ m{^/etc/csf/csf\.deny$}) {
+            $normal = 1;
+        }
+        # Standard password tools on auth files
+        if ($actor =~ m{/(usermod|passwd|chpasswd|useradd|userdel|groupadd|groupmod)\b} &&
+            $file =~ m{^/etc/(passwd|shadow|group|gshadow)$}) {
+            $normal = 1;
+        }
+
+        if ($normal) {
+            $audit_normal += $count;
+        } else {
+            push @audit_alerts, { file => $file, count => $count, actor => $actor };
+        }
+    }
+}
+
+my $audit_alert_count = 0;
+$audit_alert_count += $_->{count} for @audit_alerts;
+
+# --- Parse rkhunter section ---
+my $rkhunter_status = "no scan";
+my $rkhunter_warnings = 0;
+if ($logwatch =~ /Rootkit Hunter \(rkhunter\) Begin(.+?)Rootkit Hunter \(rkhunter\) End/s) {
+    my $rk = $1;
+    if ($rk =~ /suspect:\s*(\d+)/) { $rkhunter_status = $1 == 0 ? "OK" : "ATTENZIONE: $1 file sospetti"; }
+    if ($rk =~ /possible:\s*(\d+)/ && $1 > 0) { $rkhunter_status = "ATTENZIONE: $1 possibili rootkit"; }
+    $rkhunter_warnings = () = $rk =~ /Warning/gi;
+}
+
+
+# --- HTML helpers ---
+sub dot {
+    my ($level) = @_;
+    my %c = (ok => '#2d6a4f', warn => '#b5830a', crit => '#c1292e');
+    my $color = $c{$level} // $c{ok};
+    return qq{<td style="padding:5px 8px 5px 0;width:10px;"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:$color;"></span></td>};
+}
+
+sub row {
+    my ($dot_level, $label, $value, $hint) = @_;
+    my $d = dot($dot_level);
+    my $hint_html = $hint ? qq{<div style="font-size:11px;color:#aaa;margin-top:2px;line-height:1.4;">$hint</div>} : "";
+    return qq{<tr>$d<td style="padding:7px 0;color:#444;font-size:14px;">$label$hint_html</td><td style="padding:7px 0;text-align:right;font-size:14px;color:#1a1a19;font-variant-numeric:tabular-nums;vertical-align:top;">$value</td></tr>};
+}
+
+sub row_sub {
+    my ($label, $value) = @_;
+    return qq{<tr><td></td><td style="padding:2px 0 2px 8px;color:#999;font-size:12px;">$label</td><td style="padding:2px 0;text-align:right;color:#999;font-size:12px;font-variant-numeric:tabular-nums;">$value</td></tr>};
+}
+
+sub section_header {
+    my ($title) = @_;
+    return qq{<tr><td colspan="3" style="padding:24px 0 10px;font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid #eee;">$title</td></tr>};
+}
+
+# --- Status levels ---
+my $disk_max_pct = 0;
+for my $d (@disk_entries) { $disk_max_pct = $d->{pct} if $d->{pct} > $disk_max_pct; }
+my $disk_dot   = $disk_max_pct > 90 ? 'crit' : $disk_max_pct > 80 ? 'warn' : 'ok';
+my $mem_dot    = $mem_pct > 90 ? 'crit' : $mem_pct > 80 ? 'warn' : 'ok';
+my $backup_dot = $backup_status eq 'OK' ? 'ok' : $backup_status =~ /FALLITO/ ? 'crit' : 'warn';
+
+# --- Backup rows ---
+my $backup_rows = "";
+if (!$backup_enabled) {
+    $backup_rows .= row('crit', "Backup cPanel", "DISATTIVATO",
+        "I backup automatici sono spenti in WHM. Nessun dato &egrave; protetto.");
+}
+elsif (!$ref_date) {
+    $backup_rows .= row('crit', "Backup locale", "nessun set",
+        "Nessun backup presente in $backup_dir. Verificare WHM &raquo; Backup Configuration.");
+}
+else {
+    # Local set
+    my $local_dot = 'ok';
+    $local_dot = 'warn' if $ref_age > 1 || @local_missing;
+    $local_dot = 'crit' if $ref_age > 2 || $backup_status =~ /FALLITO/ || ($expected_count && $ref_info->{count} < $expected_count * 0.9);
+    my $age_label = $ref_age == 0 ? "oggi" : $ref_age == 1 ? "ieri" : "$ref_age giorni fa";
+    my $run_label = $ref_run
+        ? ($ref_run->{state} eq 'Success' ? "esito OK" : "esito $backup_status")
+          . ($ref_run->{start} && $ref_run->{end} ? ", " . substr($ref_run->{start}, 11) . "&rarr;" . substr($ref_run->{end}, 11) : "")
+        : "nessun log del run";
+    my $local_hint = "Ultimo set completo in $backup_dir/$ref_date ($age_label, $run_label). "
+        . "Deve contenere un archivio per ciascuno dei $expected_count account attivi.";
+    $local_hint .= " Un nuovo set &egrave; in corso ($running_date)." if $running_date;
+    $local_hint .= " Oltre 2 giorni senza backup: controllare spazio e log." if $ref_age > 2;
+    $backup_rows .= row($local_dot, "Backup locale", "$ref_date &middot; $ref_info->{count}/$expected_count account &middot; " . human_bytes($ref_info->{bytes}), $local_hint);
+    $backup_rows .= row_sub("Mancanti", join(", ", @local_missing)) if @local_missing;
+    $backup_rows .= row_sub("Set conservati",
+        scalar(@daily_sets) . " giornalieri / $ret_daily &middot; " . scalar(@weekly_sets) . " settimanali / $ret_weekly &middot; "
+        . scalar(@monthly_sets) . " mensili / $ret_monthly &middot; " . human_bytes($local_bytes) . " totali");
+    $backup_rows .= row_sub("Set in corso", $running_date) if $running_date;
+
+    # Remote destinations
+    if (!@active_dest) {
+        my $why = @destinations
+            ? join("; ", map { "$_->{name}: " . ($_->{disabled} ? "disabilitata" : "solo log") } @destinations)
+            : "nessuna destinazione configurata";
+        $backup_rows .= row('crit', "Backup remoto", "NON ATTIVO",
+            "Nessuna copia fuori dal server ($why). Se il disco si guasta, i backup locali vanno persi con i dati.");
+    }
+    for my $d (@active_dest) {
+        my $r = $remote{$d->{name}} // { users => {}, failed => 0 };
+        my $n = scalar keys %{ $r->{users} };
+        my @missing = grep { !$r->{users}{$_} } @expected_accts;
+        my $rdot = 'ok';
+        $rdot = 'warn' if @missing || $r->{failed};
+        $rdot = 'crit' if $n == 0 || ($expected_count && $n < $expected_count * 0.9);
+        my $where = $d->{bucket} ? " ($d->{type}: $d->{bucket}" . ($d->{folder} ? "/$d->{folder}" : "") . ")" : " ($d->{type})";
+        my $rhint = "Copie del set $ref_date caricate su &laquo;$d->{name}&raquo;$where. ";
+        $rhint .= $r->{last_ok} ? "Ultimo caricamento riuscito: $r->{last_ok}. " : "Nessun caricamento registrato per questo set. ";
+        $rhint .= "Trasferimenti falliti: $r->{failed}. " if $r->{failed};
+        $rhint .= "Il remoto &egrave; l'unica copia fuori dal server." ;
+        $backup_rows .= row($rdot, "Backup remoto", "$ref_date &middot; $n/$expected_count account", $rhint);
+        $backup_rows .= row_sub("Mancanti su remoto", scalar(@missing) > 8 ? scalar(@missing) . " account" : join(", ", @missing)) if @missing;
+    }
+    if (!$transporter_last_ok && @active_dest) {
+        $backup_rows .= row_sub("Trasferimenti", "nessuno registrato nel log del transporter");
+    }
+
+    # Space for the next run
+    my $space_dot = $next_blocked ? 'crit' : $bfs_free_pct <= $floor_pct + 5 ? 'warn' : 'ok';
+    my $space_hint = "Spazio libero sul volume di $backup_dir contro la soglia minima di cPanel ($floor_label). "
+        . "Sotto la soglia il backup notturno non parte. I set locali occupano " . human_bytes($local_bytes)
+        . ($acct_disk_bytes ? ", i siti " . human_bytes($acct_disk_bytes) : "") . ".";
+    $space_hint .= " ATTENZIONE: il prossimo backup verr&agrave; rifiutato." if $next_blocked;
+    $space_hint .= " Copie locali conservate anche dopo l'upload remoto (KEEPLOCAL=1)." if $keep_local && @active_dest;
+    $backup_rows .= row($space_dot, "Spazio per il prossimo backup", "${bfs_free_pct}% liberi &middot; soglia $floor_label", $space_hint);
+}
+my $clam_dot   = $clamav_outdated ? 'warn' : 'ok';
+my $load_dot   = $load5 ne '?' && $load5 > $cpu_count * 2 ? 'crit' : $load5 ne '?' && $load5 > $cpu_count ? 'warn' : 'ok';
+my $queue_dot  = $mail_queue > 500 ? 'crit' : $mail_queue > 100 ? 'warn' : 'ok';
+my $sec_dot    = $total_blocked > 200 ? 'warn' : 'ok';
+
+# Disk rows
+my %disk_hints = (
+    '/'    => "Partizione principale. Contiene sistema, siti, database e log.",
+    '/tmp' => "Spazio temporaneo per sessioni PHP e upload. Se pieno, i siti smettono di funzionare.",
+    '/home'=> "Home degli account cPanel. Contiene i file di tutti i siti ospitati.",
+);
+my $disk_rows = "";
+for my $d (@disk_entries) {
+    my $dlvl = $d->{pct} > 90 ? 'crit' : $d->{pct} > 80 ? 'warn' : 'ok';
+    my $hint = $disk_hints{$d->{mount}} // "";
+    if ($d->{pct} > 80) { $hint .= " Sopra 80%: liberare spazio." }
+    $disk_rows .= row($dlvl, "Disco $d->{mount}", "$d->{pct}% di $d->{size}", $hint);
+}
+
+# Process rows
+my $proc_rows = "";
+my $proc_count = scalar @proc_users;
+if ($proc_count > 0) {
+    my @sorted = sort { $b->{peak} <=> $a->{peak} } @proc_users;
+    my $shown = $proc_count > 5 ? 5 : $proc_count;
+    for my $i (0..$shown-1) {
+        $proc_rows .= row_sub($sorted[$i]{user}, "picco $sorted[$i]{peak}");
+    }
+    if ($proc_count > 5) {
+        $proc_rows .= row_sub("", "+@{[$proc_count - 5]} altri");
+    }
+}
+
+my $clam_label = $clamav_outdated ? "da aggiornare" : "aggiornato";
+
+# --- Build HTML ---
+my $summary = <<"EOF";
+<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#ffffff;font-family:-apple-system,Helvetica,Arial,sans-serif;">
+
+<!-- Header -->
+<table width="100%" cellpadding="0" cellspacing="0" style="border-bottom:1px solid #e8e7e6;">
+<tr><td style="padding:28px 32px 20px;">
+  <div style="font-family:Georgia,serif;font-size:20px;color:#1a1a19;letter-spacing:-0.3px;">$SHORTNAME</div>
+  <div style="font-size:12px;color:#aaa;margin-top:4px;">$date_str &middot; uptime $uptime_str</div>
+</td></tr>
+</table>
+
+<!-- Content -->
+<table width="100%" cellpadding="0" cellspacing="0">
+<tr><td style="padding:8px 32px 32px;">
+<table width="100%" cellpadding="0" cellspacing="0">
+
+@{[section_header("Risorse")]}
+$disk_rows
+@{[row($mem_dot, "Memoria", "${mem_pct}% &middot; ${mem_avail}M liberi / ${mem_total}M",
+    "RAM disponibile per applicazioni e cache. Sopra 90% il server inizia a usare swap, rallentando.")]}
+@{[row($load_dot, "Carico", "$load1 / $load5 / $load15",
+    "Media processi in attesa a 1/5/15 min. Valori normali sotto $cpu_count (1 per CPU). Sopra ${\ ($cpu_count*2)} indica saturazione.")]}
+@{[$swap_used > 100 ? row('warn', "Swap", "${swap_used}M / ${swap_total}M",
+    "Memoria su disco usata quando la RAM non basta. Uso elevato causa rallentamenti.") : ""]}
+
+@{[section_header("Sicurezza")]}
+@{[row($sec_dot, "Attacchi bloccati", $total_blocked,
+    "IP bloccati automaticamente dal firewall CSF dopo tentativi di accesso falliti.")]}
+@{[row_sub("SSH brute-force", $ssh_blocked)]}
+@{[row_sub("cPanel login", $cpanel_blocked)]}
+@{[row_sub("Email/SMTP", $smtp_blocked)]}
+@{[$other_blocked > 0 ? row_sub("Altro", $other_blocked) : ""]}
+@{[do {
+    my $audit_dot = $audit_alert_count > 0 ? "crit" : "ok";
+    my $audit_value = $audit_total > 0
+        ? "$audit_total modifiche" . ($audit_alert_count > 0 ? " ($audit_alert_count anomale)" : "")
+        : "nessuna modifica";
+    my $audit_hint = $audit_alert_count > 0
+        ? "ATTENZIONE: rilevate modifiche anomale a file critici. Controllare il log completo sotto."
+        : "Monitoraggio auditd su credenziali, SSH, firewall, cron e cPanel. Nessuna anomalia.";
+    row($audit_dot, "File critici (auditd)", $audit_value, $audit_hint);
+}]}
+@{[do {
+    my $out = "";
+    for my $a (@audit_alerts) {
+        $out .= row_sub("$a->{file}", "$a->{count}x $a->{actor}");
+    }
+    $out;
+}]}
+@{[$exim_auth_fail > 0 ? row('warn', "Auth SMTP fallite", $exim_auth_fail,
+    "Tentativi di login falliti sul server di posta. Numeri alti indicano attacchi brute-force sulle caselle email.") : ""]}
+
+@{[do {
+    my $rk_dot = $rkhunter_status eq "OK" ? "ok" : $rkhunter_status eq "no scan" ? "warn" : "crit";
+    row($rk_dot, "Rootkit scan", $rkhunter_status,
+        "Scansione giornaliera per rootkit e file di sistema compromessi. Eseguita da rkhunter.");
+}]}
+
+@{[section_header("Backup")]}
+$backup_rows
+
+@{[section_header("Servizi")]}
+@{[row($queue_dot, "Coda email", "$mail_queue messaggi",
+    "Email in attesa di invio. Una coda alta pu&ograve; indicare spam in uscita o problemi di consegna.")]}
+@{[row('ok', "Connessioni HTTP", $apache_conns,
+    "Connessioni attive su porte 80/443. Indica il carico web in questo momento.")]}
+@{[row('ok', "MySQL", "threads $mysql_threads &middot; up ${mysql_up_days}g",
+    "Thread attivi del database e giorni dall'ultimo riavvio. Molti thread = molte query simultanee.")]}
+@{[row($clam_dot, "ClamAV", $clam_label,
+    "Antivirus per la scansione email. Se non aggiornato, nuove minacce non vengono rilevate.")]}
+
+@{[$proc_count > 0 ? section_header("Processi eccessivi ($proc_count utenti)") . $proc_rows : ""]}
+@{[$proc_count > 0 ? '<tr><td colspan="3" style="padding:4px 0 0 8px;font-size:11px;color:#aaa;">Utenti con pi&ugrave; processi PHP del limite. Pu&ograve; indicare script lenti o loop infiniti.</td></tr>' : ""]}
+
+</table>
+</td></tr>
+</table>
+
+<!-- Full logwatch log -->
+<table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #e8e7e6;">
+<tr><td style="padding:24px 32px;">
+  <div style="font-size:11px;font-weight:600;color:#999;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:4px;">Log completo</div>
+  <div style="font-size:11px;color:#aaa;margin-bottom:14px;">Output completo di logwatch. Contiene tutti i dettagli su login, servizi, errori e attivit&agrave; di sistema.</div>
+  <pre style="font-family:'SF Mono',Menlo,Consolas,monospace;font-size:11px;line-height:1.5;color:#555;background:#fafaf9;border:1px solid #eee;border-radius:3px;padding:20px;white-space:pre-wrap;word-wrap:break-word;">$logwatch_escaped</pre>
+</td></tr>
+</table>
+
+</body></html>
+EOF
+
+# --- Send report ---
+if ($dry_run) {
+    print $summary;
+    exit 0;
+}
+
+my $to_header = $send_summary
+    ? "To: $TECH_TO\n"   # weekly: will add Cc SUMMARY_TO when ready
+    : "To: $TECH_TO\n";
+
+if (open my $mail, "|-", $SENDMAIL) {
+    print $mail $to_header;
+    print $mail "From: $FROM\n";
+    print $mail "Subject: Report $SHORTNAME — $date_str\n";
+    print $mail "MIME-Version: 1.0\n";
+    print $mail "Content-Type: text/html; charset=UTF-8\n";
+    print $mail "\n";
+    print $mail $summary;
+    close $mail;
+    print "Report sent to $TECH_TO\n";
+} else {
+    warn "Cannot open sendmail: $!\n";
+}

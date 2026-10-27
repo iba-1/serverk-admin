@@ -18,6 +18,7 @@
 - [Struttura del repo](#struttura-del-repo)
 - [Hardening](#hardening)
 - [php2shell (CVE-2026-109618 / 109619)](#php2shell-cve-2026-109618--109619)
+- [Report giornaliero (digest)](#report-giornaliero-digest)
 - [Panoramica forensics](#panoramica)
 - [Prerequisiti](#prerequisiti)
 - [Installazione](#installazione)
@@ -43,6 +44,7 @@
 *.sh                 toolkit forensics / ripristino (vedi sotto)
 harden-0N-*.sh       hardening incrementale (CSF, MariaDB bind, ModSecurity, SSH)
 php2shell/           mitigazione + patch per CVE-2026-109618 / CVE-2026-109619
+digest/              report giornaliero via email (logwatch + stato backup locali/remoti + spazio)
 audits/              documentazione per-incidente con dati cliente: NON versionata (.gitignore)
 ```
 
@@ -66,6 +68,16 @@ Due RCE non autenticate in PHP core (CVSS v4 9.2), fix upstream solo per 8.2+.
 `php2shell/` contiene mitigazione immediata senza impatto applicativo (regole mod_security mirate,
 `LimitRequestBody`, `session.upload_progress` off), patch automatica quando EA4 pubblica i pacchetti,
 rollback e verifica. Dettagli in [`php2shell/README.md`](php2shell/README.md).
+
+## Report giornaliero (digest)
+
+`digest/server-digest` (Perl, solo moduli core) è il report HTML che `/etc/cron.daily/0logwatch`
+invia ogni notte. Oltre a risorse, sicurezza e logwatch completo, la sezione **Backup** mostra:
+ultimo set locale completo (account presenti / attesi, dimensione, esito e durata del run),
+set conservati rispetto alla retention, copie effettivamente caricate sulla destinazione remota
+(con l'elenco degli account mancanti) e spazio libero rispetto alla soglia minima sotto la quale
+cPanel rifiuta di avviare il backup. `--dry-run` stampa l'HTML senza inviare nulla.
+Dettagli in [`digest/README.md`](digest/README.md).
 
 ---
 

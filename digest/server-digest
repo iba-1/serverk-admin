@@ -12,6 +12,7 @@ use warnings;
 use POSIX qw(strftime);
 use Getopt::Long;
 use Time::Local qw(timelocal);
+use MIME::QuotedPrint qw(encode_qp);   # wraps lines: exim rejects lines > 2048 bytes
 
 my $send_summary = 0;
 my $dry_run      = 0;   # --dry-run: print the HTML to stdout instead of mailing it
@@ -654,8 +655,9 @@ if (open my $mail, "|-", $SENDMAIL) {
     print $mail "Subject: Report $SHORTNAME — $date_str\n";
     print $mail "MIME-Version: 1.0\n";
     print $mail "Content-Type: text/html; charset=UTF-8\n";
+    print $mail "Content-Transfer-Encoding: quoted-printable\n";
     print $mail "\n";
-    print $mail $summary;
+    print $mail encode_qp($summary);
     close $mail;
     print "Report sent to $TECH_TO\n";
 } else {

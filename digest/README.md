@@ -59,7 +59,8 @@ Fonti, tutte in sola lettura:
 | `/var/cpanel/backups/*.backup_destination` | destinazioni remote: tipo, bucket/cartella, `disabled`, `only_used_for_logs` |
 | `<BACKUPDIR>/YYYY-MM-DD`, `weekly/`, `monthly/` | set locali: conteggio archivi e dimensione (somma degli `.tar.gz`, niente `du`) |
 | `/usr/local/cpanel/logs/cpbackup/<epoch>.log` | esito del run (`Final state is Backup::…`), orari, account riusciti/falliti |
-| `/usr/local/cpanel/logs/cpbackup_transporter.log` | trasferimenti riusciti/falliti verso ogni destinazione per il set di riferimento |
+| `<BACKUPDIR>/transports.db` (via `sqlite3 -readonly`) | upload completati per destinazione/account/set: fonte autorevole |
+| `/usr/local/cpanel/logs/cpbackup_transporter.log` | trasferimenti falliti e fallback se il DB manca. Il demone tronca questo log ("Initializing log file") a ogni riavvio, più volte per run: da solo sottostima |
 | `whmapi1 listaccts` | account attesi nel set (flag `backup` attivo, non sospesi) e spazio usato dai siti |
 
 Righe prodotte:

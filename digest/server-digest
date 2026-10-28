@@ -252,6 +252,7 @@ my @destinations;
 for my $f (glob("/var/cpanel/backups/*.backup_destination")) {
     my $d = read_flat_yaml($f);
     push @destinations, {
+        id        => $d->{id} // '',
         name      => $d->{name} // 'remote',
         type      => $d->{type} // '?',
         disabled  => $d->{disabled} // 0,
@@ -282,6 +283,28 @@ if ($ref_date && open my $fh, '<', '/usr/local/cpanel/logs/cpbackup_transporter.
         }
     }
     close $fh;
+}
+
+# transports.db is the authoritative record of completed uploads: the transporter
+# daemon truncates its log ("Initializing log file") every time it restarts, which
+# happens several times per run, so the log alone under-reports. Timestamps are UTC.
+my $tdb = "$backup_dir/transports.db";
+if ($ref_date && -r $tdb && -x '/usr/bin/sqlite3') {
+    my %name_by_id = map { $_->{id} => $_->{name} } grep { $_->{id} } @destinations;
+    my $sql = "select t.transport, u.user, max(h.end_timestamp) from transport_history h"
+            . " join users u on u.id = h.user_id join occurrences o on o.id = h.occurrence_id"
+            . " join transports t on t.id = h.transport_id"
+            . " where o.date = '$ref_date' and h.end_timestamp is not null group by 1, 2;";
+    my $out = `/usr/bin/sqlite3 -readonly -separator '|' '$tdb' "$sql" 2>/dev/null`;
+    for my $l (split /\n/, $out) {
+        my ($tid, $user, $end) = split /\|/, $l;
+        next unless $tid && $user;
+        my $dest = $name_by_id{$tid} // $tid;
+        $remote{$dest}{users}{$user} = 1;
+        $remote{$dest}{failed} //= 0;
+        $remote{$dest}{last_ok} = "$end UTC" if !$remote{$dest}{last_ok} || $remote{$dest}{last_ok} lt "$end UTC";
+        $transporter_last_ok //= $end;
+    }
 }
 
 # Free space on the backup volume vs cPanel's floor
